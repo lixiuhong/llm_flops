@@ -60,20 +60,34 @@ def make_tensors(s_q: int, s_kv: int, topk: int, device: torch.device):
 
 def bench_one(s_q: int, s_kv: int, topk: int, device: torch.device):
     q, kv, indices = make_tensors(s_q, s_kv, topk, device)
-    torch.cuda.synchronize()
 
-    # Warmup
-    for _ in range(NUM_WARMUP):
+    def run():
         flash_mla_sparse_fwd(q, kv, indices, SM_SCALE, D_V)
+
+    # Warmup (also primes any lazy init before graph capture)
+    torch.cuda.synchronize()
+    for _ in range(NUM_WARMUP):
+        run()
     torch.cuda.synchronize()
 
-    # Benchmark with CUDA events
+    # Capture a 1-iteration CUDA graph (flash_mla_sparse_fwd is graph-capturable),
+    # then time NUM_RUNS replays with per-iteration events. This removes per-call
+    # launch overhead while keeping per-iteration avg/min/max.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+
+    for _ in range(NUM_WARMUP):
+        graph.replay()
+    torch.cuda.synchronize()
+
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_RUNS)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_RUNS)]
 
     for i in range(NUM_RUNS):
         start_events[i].record()
-        flash_mla_sparse_fwd(q, kv, indices, SM_SCALE, D_V)
+        graph.replay()
         end_events[i].record()
 
     torch.cuda.synchronize()
@@ -82,6 +96,8 @@ def bench_one(s_q: int, s_kv: int, topk: int, device: torch.device):
     avg_ms = sum(times_ms) / len(times_ms)
     min_ms = min(times_ms)
     max_ms = max(times_ms)
+
+    del graph
 
     # FLOPs (sparse MLA, follows the theoretical formula with s_k -> topk):
     #   score (Q @ K^T): 2 * h_q * s_q * topk * d_k

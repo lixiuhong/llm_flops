@@ -77,18 +77,30 @@ def bench_one(s_q: int, s_kv: int, device: torch.device):
             softmax_scale=SM_SCALE,
         )
 
-    # Warmup
+    # Warmup (initializes sched_meta on first call, before graph capture)
+    torch.cuda.synchronize()
     for _ in range(NUM_WARMUP):
         run()
     torch.cuda.synchronize()
 
-    # Benchmark with CUDA events
+    # Capture a 1-iteration CUDA graph (flash_mla_with_kvcache is graph-capturable
+    # once sched_meta is initialized), then time NUM_RUNS replays with per-iteration
+    # events. Removes per-call launch overhead while keeping per-iteration avg/min/max.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+
+    for _ in range(NUM_WARMUP):
+        graph.replay()
+    torch.cuda.synchronize()
+
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_RUNS)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_RUNS)]
 
     for i in range(NUM_RUNS):
         start_events[i].record()
-        run()
+        graph.replay()
         end_events[i].record()
 
     torch.cuda.synchronize()
@@ -122,7 +134,7 @@ def bench_one(s_q: int, s_kv: int, device: torch.device):
     # Compute-memory ratio (FLOPs / byte) — kernel is compute-bound when this >> GPU's ratio
     flops_per_byte = flops / mem_bytes
 
-    del q, k_cache, block_table, cache_seqlens, tile_scheduler_metadata, num_splits
+    del graph, q, k_cache, block_table, cache_seqlens, tile_scheduler_metadata, num_splits
     return avg_ms, min_ms, max_ms, tflops, tbps, flops_per_byte
 
 
